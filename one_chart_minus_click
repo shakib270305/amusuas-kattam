@@ -1,0 +1,796 @@
+ // ==UserScript==
+ // @name         Pocket Option - Single Chart Auto Timer + Down Protection
+ // @namespace    pocketoption-auto
+ // @version      7.0
+ // @description  Single chart timer minus + Down trade live-price protection
+ // @match        https://pocketoption.com/*
+ // @run-at       document-start
+ // @grant        none
+ // ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const TAG = '[PO AUTO]';
+
+    const state = {
+        timerRunning: false,
+        timerInterval: null,
+        popupWait: null,
+
+        downActive: false,
+        entry: null,
+        upper: null,
+        lower: null,
+
+        lowerTouches: 0,
+        waitEntry: false,
+
+        lastPrice: null,
+        lastAsset: null,
+
+        lastTradeEntry: null
+    };
+
+    // =========================================================
+    // HELPERS
+    // =========================================================
+
+    function log(...x) {
+        console.log(TAG, ...x);
+    }
+
+    function warn(...x) {
+        console.warn(TAG, ...x);
+    }
+
+    function visible(el) {
+        if (!el) return false;
+
+        const r = el.getBoundingClientRect();
+        const s = getComputedStyle(el);
+
+        return (
+            r.width > 0 &&
+            r.height > 0 &&
+            s.display !== 'none' &&
+            s.visibility !== 'hidden'
+        );
+    }
+
+    function clickReal(el) {
+        if (!el) return false;
+
+        try {
+            const r = el.getBoundingClientRect();
+
+            const opt = {
+                bubbles: true,
+                cancelable: true,
+                view: window,
+                clientX: r.left + r.width / 2,
+                clientY: r.top + r.height / 2,
+                button: 0
+            };
+
+            el.dispatchEvent(new MouseEvent('mousedown', opt));
+            el.dispatchEvent(new MouseEvent('mouseup', opt));
+            el.dispatchEvent(new MouseEvent('click', opt));
+
+            return true;
+        } catch (e) {
+            try {
+                el.click();
+                return true;
+            } catch (_) {
+                return false;
+            }
+        }
+    }
+
+    // =========================================================
+    // SINGLE CHART TIMER
+    // =========================================================
+
+    function findTimer() {
+        const all = [
+            ...document.querySelectorAll(
+                '.block--expiration-inputs .control__value'
+            )
+        ].filter(visible);
+
+        if (!all.length) return null;
+
+        /*
+         * এখন মাত্র ১টা chart আছে।
+         * তাই প্রথম visible expiration timer-ই target।
+         */
+        return all[0];
+    }
+
+    function findSecondsMinus() {
+        const buttons = [
+            ...document.querySelectorAll(
+                '.trading-panel-modal .btn-minus'
+            )
+        ].filter(visible);
+
+        /*
+         * Popup-এর তিনটি minus:
+         *
+         * hours
+         * minutes
+         * seconds  <-- third one
+         */
+        if (buttons.length >= 3) {
+            return buttons[2];
+        }
+
+        return null;
+    }
+
+    function getTimerSeconds() {
+        const timer = findTimer();
+
+        if (!timer) return null;
+
+        const text = (
+            timer.innerText ||
+            timer.textContent ||
+            ''
+        ).trim();
+
+        const m = text.match(
+            /^(\d{1,2}):(\d{2}):(\d{2})$/
+        );
+
+        if (!m) return null;
+
+        return (
+            Number(m[1]) * 3600 +
+            Number(m[2]) * 60 +
+            Number(m[3])
+        );
+    }
+
+    function stopTimer(reason) {
+        if (state.timerInterval !== null) {
+            clearInterval(state.timerInterval);
+            state.timerInterval = null;
+        }
+
+        if (state.popupWait !== null) {
+            clearInterval(state.popupWait);
+            state.popupWait = null;
+        }
+
+        state.timerRunning = false;
+
+        log('TIMER STOPPED:', reason);
+    }
+
+    function minusOnce() {
+        if (!state.timerRunning) return;
+
+        const seconds = getTimerSeconds();
+
+        /*
+         * সবচেয়ে গুরুত্বপূর্ণ অংশ:
+         *
+         * 00:00:03 হলে আর minus click হবে না।
+         */
+        if (seconds !== null && seconds <= 3) {
+            stopTimer(
+                '00:00:03 reached - NO MORE MINUS CLICK'
+            );
+            return;
+        }
+
+        const minus = findSecondsMinus();
+
+        if (!minus) {
+            warn('Seconds minus button not found.');
+            return;
+        }
+
+        clickReal(minus);
+
+        log(
+            'MINUS CLICK | Timer seconds:',
+            seconds
+        );
+    }
+
+    function startTimer() {
+        if (state.timerRunning) {
+            log('Timer already running.');
+            return;
+        }
+
+        const timer = findTimer();
+
+        if (!timer) {
+            warn('Single-chart expiration timer not found.');
+            return;
+        }
+
+        const current = getTimerSeconds();
+
+        if (current !== null && current <= 3) {
+            warn('Timer already <= 3 seconds.');
+            return;
+        }
+
+        state.timerRunning = true;
+
+        log(
+            'SINGLE CHART TIMER FOUND:',
+            timer.textContent.trim()
+        );
+
+        log('Opening timer...');
+
+        clickReal(timer);
+
+        let tries = 0;
+
+        state.popupWait = setInterval(() => {
+
+            if (!state.timerRunning) {
+                clearInterval(state.popupWait);
+                state.popupWait = null;
+                return;
+            }
+
+            tries++;
+
+            const minus = findSecondsMinus();
+
+            if (minus) {
+
+                clearInterval(state.popupWait);
+                state.popupWait = null;
+
+                log('Seconds minus found.');
+
+                // প্রথম click
+                minusOnce();
+
+                if (!state.timerRunning) return;
+
+                // এরপর প্রতি 1 second
+                state.timerInterval = setInterval(() => {
+                    minusOnce();
+                }, 1000);
+
+                return;
+            }
+
+            if (tries >= 30) {
+
+                clearInterval(state.popupWait);
+                state.popupWait = null;
+
+                warn('Seconds minus button not found.');
+            }
+
+        }, 100);
+    }
+
+    // =========================================================
+    // PRICE CALCULATION
+    // =========================================================
+
+    function precisionOf(n) {
+        const s = String(n);
+
+        if (!s.includes('.')) return 5;
+
+        return s.split('.')[1].length;
+    }
+
+    function getOffset(entry) {
+        const p = precisionOf(entry);
+
+        /*
+         * Example:
+         *
+         * Entry = 1.04700
+         * precision = 5
+         * offset = 0.00005
+         */
+
+        return 5 * Math.pow(10, -p);
+    }
+
+    function setupDown(entry, source) {
+
+        if (!Number.isFinite(entry) || entry <= 0) {
+            warn('Invalid entry:', entry);
+            return;
+        }
+
+        const offset = getOffset(entry);
+        const p = Math.max(precisionOf(entry), 5);
+
+        state.downActive = true;
+
+        state.entry = entry;
+
+        state.upper = Number(
+            (entry + offset).toFixed(p)
+        );
+
+        state.lower = Number(
+            (entry - offset).toFixed(p)
+        );
+
+        state.lowerTouches = 0;
+        state.waitEntry = false;
+
+        log('==============================');
+        log('DOWN TRADE DETECTED');
+        log('Source:', source);
+        log('ENTRY:', state.entry);
+        log('UPPER:', state.upper);
+        log('LOWER:', state.lower);
+        log('==============================');
+    }
+
+    // =========================================================
+    // STOP EVERYTHING
+    // =========================================================
+
+    function stopEverything(reason) {
+
+        stopTimer(reason);
+
+        state.downActive = false;
+        state.waitEntry = false;
+
+        log('ALL AUTOMATION STOPPED:', reason);
+    }
+
+    // =========================================================
+    // LIVE PRICE
+    // =========================================================
+
+    function processPrice(price, asset) {
+
+        if (
+            !Number.isFinite(price) ||
+            price <= 0
+        ) {
+            return;
+        }
+
+        state.lastPrice = price;
+        state.lastAsset = asset || null;
+
+        if (!state.downActive) {
+            return;
+        }
+
+        const entry = state.entry;
+        const upper = state.upper;
+        const lower = state.lower;
+
+        if (!Number.isFinite(entry)) return;
+
+        const p = Math.max(
+            precisionOf(entry),
+            5
+        );
+
+        const tolerance =
+            Math.pow(10, -p) / 2;
+
+        // =====================================================
+        // UPPER TOUCH
+        // =====================================================
+
+        if (
+            price >= upper - tolerance &&
+            price <= upper + tolerance
+        ) {
+
+            log(
+                'UPPER TOUCH:',
+                price,
+                'TARGET:',
+                upper
+            );
+
+            stopEverything(
+                'Live price touched Entry + threshold'
+            );
+
+            return;
+        }
+
+        // =====================================================
+        // LOWER TOUCH
+        // =====================================================
+
+        if (
+            price >= lower - tolerance &&
+            price <= lower + tolerance
+        ) {
+
+            state.lowerTouches++;
+
+            log(
+                'LOWER TOUCH #' +
+                state.lowerTouches,
+                '| Price:',
+                price,
+                '| Target:',
+                lower
+            );
+
+            if (state.lowerTouches >= 2) {
+
+                state.waitEntry = true;
+
+                log(
+                    'SECOND LOWER TOUCH -> waiting for ENTRY'
+                );
+            }
+
+            return;
+        }
+
+        // =====================================================
+        // RETURN TO ENTRY AFTER SECOND LOWER TOUCH
+        // =====================================================
+
+        if (state.waitEntry) {
+
+            if (
+                Math.abs(price - entry) <= tolerance
+            ) {
+
+                log(
+                    'ENTRY TOUCHED:',
+                    price,
+                    '| ENTRY:',
+                    entry
+                );
+
+                stopEverything(
+                    'Second lower touch completed and price returned to Entry'
+                );
+
+                return;
+            }
+        }
+    }
+
+    // =========================================================
+    // WEBSOCKET
+    // =========================================================
+
+    const NativeWebSocket = window.WebSocket;
+
+    if (NativeWebSocket) {
+
+        window.WebSocket = function (...args) {
+
+            const ws = new NativeWebSocket(...args);
+
+            log('WebSocket connected.');
+
+            ws.addEventListener(
+                'message',
+                event => {
+
+                    if (
+                        typeof event.data !== 'string'
+                    ) {
+                        return;
+                    }
+
+                    const raw = event.data;
+
+                    /*
+                     * Pocket Option-এর update stream
+                     * message detect করা।
+                     */
+
+                    if (
+                        !raw.includes('updateStream') &&
+                        !raw.includes('_otc')
+                    ) {
+                        return;
+                    }
+
+                    parseSocket(raw);
+                }
+            );
+
+            return ws;
+        };
+
+        window.WebSocket.prototype =
+            NativeWebSocket.prototype;
+
+        window.WebSocket.CONNECTING =
+            NativeWebSocket.CONNECTING;
+
+        window.WebSocket.OPEN =
+            NativeWebSocket.OPEN;
+
+        window.WebSocket.CLOSING =
+            NativeWebSocket.CLOSING;
+
+        window.WebSocket.CLOSED =
+            NativeWebSocket.CLOSED;
+
+        log('WebSocket monitor installed.');
+    }
+
+    function parseSocket(raw) {
+
+        let text = raw;
+
+        /*
+         * Socket.IO prefix remove
+         */
+        text = text.replace(/^\d+/, '');
+
+        let data = null;
+
+        try {
+            data = JSON.parse(text);
+        } catch (_) {
+
+            const i = text.indexOf('[');
+
+            if (i >= 0) {
+                try {
+                    data = JSON.parse(
+                        text.slice(i)
+                    );
+                } catch (_) {}
+            }
+        }
+
+        if (!data) return;
+
+        scanData(data);
+    }
+
+    function scanData(value) {
+
+        if (Array.isArray(value)) {
+
+            /*
+             * Example:
+             *
+             * ["AUDCAD_otc", 1789053243.077, 1.02745]
+             */
+
+            if (
+                value.length >= 3 &&
+                typeof value[0] === 'string'
+            ) {
+
+                const asset = value[0];
+
+                const possible = [];
+
+                for (
+                    let i = 1;
+                    i < value.length;
+                    i++
+                ) {
+
+                    const n = Number(value[i]);
+
+                    if (
+                        Number.isFinite(n) &&
+                        n > 0 &&
+                        n < 100000
+                    ) {
+
+                        /*
+                         * Unix timestamp বাদ
+                         */
+                        if (n > 1000000000) {
+                            continue;
+                        }
+
+                        possible.push(n);
+                    }
+                }
+
+                if (possible.length) {
+
+                    /*
+                     * সাধারণত price শেষের numeric value।
+                     */
+                    const price =
+                        possible[possible.length - 1];
+
+                    processPrice(
+                        price,
+                        asset
+                    );
+                }
+            }
+
+            for (const x of value) {
+                scanData(x);
+            }
+
+            return;
+        }
+
+        if (
+            typeof value === 'object' &&
+            value !== null
+        ) {
+
+            const keys = [
+                'price',
+                'rate',
+                'quote',
+                'value',
+                'ask',
+                'bid'
+            ];
+
+            for (const key of keys) {
+
+                if (
+                    Object.prototype.hasOwnProperty.call(
+                        value,
+                        key
+                    )
+                ) {
+
+                    const n =
+                        Number(value[key]);
+
+                    if (
+                        Number.isFinite(n) &&
+                        n > 0 &&
+                        n < 100000
+                    ) {
+
+                        processPrice(
+                            n,
+                            value.asset ||
+                            value.symbol ||
+                            value.name ||
+                            null
+                        );
+                    }
+                }
+            }
+
+            for (const key of Object.keys(value)) {
+                scanData(value[key]);
+            }
+        }
+    }
+
+    // =========================================================
+    // FIND LATEST DOWN TRADE
+    // =========================================================
+
+    function findDownTrade() {
+
+        const divs = [
+            ...document.querySelectorAll('div')
+        ];
+
+        for (const el of divs) {
+
+            if (!visible(el)) continue;
+
+            const text = (
+                el.innerText ||
+                el.textContent ||
+                ''
+            ).trim();
+
+            if (!text) continue;
+
+            if (
+                !/Your forecast:\s*SELL/i.test(text)
+            ) {
+                continue;
+            }
+
+            const m = text.match(
+                /Open price:\s*([0-9]+(?:\.[0-9]+)?)/i
+            );
+
+            if (!m) continue;
+
+            const entry = Number(m[1]);
+
+            if (
+                Number.isFinite(entry) &&
+                entry > 0
+            ) {
+                return entry;
+            }
+        }
+
+        return null;
+    }
+
+    /*
+     * Trades panel scan
+     */
+    setInterval(() => {
+
+        const entry = findDownTrade();
+
+        if (!Number.isFinite(entry)) {
+            return;
+        }
+
+        if (entry === state.lastTradeEntry) {
+            return;
+        }
+
+        state.lastTradeEntry = entry;
+
+        setupDown(
+            entry,
+            'Latest Trades panel'
+        );
+
+    }, 100);
+
+    // =========================================================
+    // SHIFT + LEFT CLICK
+    // =========================================================
+
+    document.addEventListener(
+        'click',
+        event => {
+
+            if (!event.shiftKey) return;
+
+            log('SHIFT + LEFT CLICK');
+
+            /*
+             * যদি Down trade ইতিমধ্যে Trades panel-এ থাকে,
+             * entry automatically ধরবে।
+             */
+            const entry = findDownTrade();
+
+            if (Number.isFinite(entry)) {
+
+                setupDown(
+                    entry,
+                    'Shift click + latest Down trade'
+                );
+            }
+
+            /*
+             * Timer start
+             */
+            startTimer();
+
+        },
+        true
+    );
+
+    // =========================================================
+    // START
+    // =========================================================
+
+    log('====================================');
+    log('POCKET OPTION SINGLE CHART AUTO v7');
+    log('1 chart mode');
+    log('Shift + Left Click -> Timer');
+    log('00:00:03 -> HARD STOP');
+    log('Down + Live Price protection ON');
+    log('====================================');
+
+})();
